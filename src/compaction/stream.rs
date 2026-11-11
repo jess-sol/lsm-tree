@@ -188,7 +188,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
 
                     // NOTE: Only item of this key and thus latest version, so return it no matter what
                     // ...
-                } else if peeked.key.seqno < self.gc_seqno_threshold {
+                } else if head.key.seqno <= self.gc_seqno_threshold {
                     if head.key.value_type == ValueType::Tombstone && self.evict_tombstones {
                         fail_iter!(self.drain_key(&head.key.user_key));
                         continue;
@@ -199,7 +199,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> Iterator for Compaction
                     let drop_weak_tombstone = peeked.key.value_type == ValueType::Value
                         && head.key.value_type == ValueType::WeakTombstone;
 
-                    // NOTE: Next item is expired,
+                    // NOTE: This item is at or below the watermark, so every snapshot reads it,
                     // so the tail of this user key is entirely expired, so drain it all
                     fail_iter!(self.drain_key(&head.key.user_key));
 
@@ -432,6 +432,33 @@ mod tests {
 
         assert_eq!(
             InternalValue::from_components(*b"a", *b"val", 999, ValueType::Value),
+            iter.next().unwrap()?,
+        );
+        iter_closed!(iter);
+
+        Ok(())
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used)]
+    fn compaction_stream_gc_keeps_newest_version_below_watermark() -> crate::Result<()> {
+        // NOTE: A snapshot at the watermark reads the newest version at or below it,
+        // which is not the head while the head is above the watermark
+        let vec = [
+            InternalValue::from_components(*b"a", *b"new", 60, ValueType::Value),
+            InternalValue::from_components(*b"a", *b"seen", 5, ValueType::Value),
+            InternalValue::from_components(*b"a", *b"old", 3, ValueType::Value),
+        ];
+
+        let iter = vec.iter().cloned().map(Ok);
+        let mut iter = CompactionStream::new(iter, 49);
+
+        assert_eq!(
+            InternalValue::from_components(*b"a", *b"new", 60, ValueType::Value),
+            iter.next().unwrap()?,
+        );
+        assert_eq!(
+            InternalValue::from_components(*b"a", *b"seen", 5, ValueType::Value),
             iter.next().unwrap()?,
         );
         iter_closed!(iter);
