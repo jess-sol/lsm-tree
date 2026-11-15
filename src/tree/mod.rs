@@ -5,6 +5,7 @@
 pub mod ingest;
 pub mod inner;
 pub mod sealed;
+mod write_sorted;
 
 use crate::{
     compaction::{drop_range::OwnedBounds, state::CompactionState, CompactionStrategy},

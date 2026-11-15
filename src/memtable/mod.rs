@@ -5,13 +5,60 @@
 use crate::key::InternalKey;
 use crate::{
     value::{InternalValue, SeqNo, UserValue},
-    ValueType,
+    UserKey, ValueType,
 };
 use crossbeam_skiplist::SkipMap;
-use std::ops::RangeBounds;
+use std::ops::{Bound, RangeBounds};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
 pub use crate::tree::inner::MemtableId;
+
+/// The rows of a memtable.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a memtable holds one; a boxed skiplist would cost every insert a pointer"
+)]
+enum Items {
+    /// Rows written one at a time, in a lock-free skiplist.
+    Skiplist(SkipMap<InternalKey, UserValue>),
+
+    /// The rows of one batch as they came, in key order, read by bisection.
+    Sorted(Vec<(InternalKey, UserValue)>),
+}
+
+/// The rows of either form, as one iterator type.
+enum Rows<S, V> {
+    Skiplist(S),
+    Sorted(V),
+}
+
+impl<S, V> Iterator for Rows<S, V>
+where
+    S: Iterator<Item = InternalValue>,
+    V: Iterator<Item = InternalValue>,
+{
+    type Item = InternalValue;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Skiplist(rows) => rows.next(),
+            Self::Sorted(rows) => rows.next(),
+        }
+    }
+}
+
+impl<S, V> DoubleEndedIterator for Rows<S, V>
+where
+    S: DoubleEndedIterator<Item = InternalValue>,
+    V: DoubleEndedIterator<Item = InternalValue>,
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Skiplist(rows) => rows.next_back(),
+            Self::Sorted(rows) => rows.next_back(),
+        }
+    }
+}
 
 /// The memtable serves as an intermediary, ephemeral, sorted storage for new items
 ///
@@ -20,9 +67,8 @@ pub struct Memtable {
     #[doc(hidden)]
     pub id: MemtableId,
 
-    /// The actual content, stored in a lock-free skiplist.
-    #[doc(hidden)]
-    pub items: SkipMap<InternalKey, UserValue>,
+    /// The actual content.
+    items: Items,
 
     /// Approximate active memtable size.
     ///
@@ -60,19 +106,60 @@ impl Memtable {
     pub fn new(id: MemtableId) -> Self {
         Self {
             id,
-            items: SkipMap::default(),
+            items: Items::Skiplist(SkipMap::default()),
             approximate_size: AtomicU64::default(),
             highest_seqno: AtomicU64::default(),
             requested_rotation: AtomicBool::default(),
         }
     }
 
+    /// A memtable over the rows of one batch, all at `seqno`, that takes no further row.
+    ///
+    /// `rows` come in key order with no key twice. A row without a value is a removal.
+    pub(crate) fn from_sorted(
+        id: MemtableId,
+        rows: Vec<(UserKey, Option<UserValue>)>,
+        seqno: SeqNo,
+    ) -> Self {
+        debug_assert!(
+            rows.is_sorted_by(|a, b| a.0 < b.0),
+            "the rows of a batch come in key order, no key twice",
+        );
+
+        let mut size = 0;
+
+        let items = rows
+            .into_iter()
+            .map(|(key, value)| {
+                let item = match value {
+                    Some(value) => {
+                        InternalValue::from_components(key, value, seqno, ValueType::Value)
+                    }
+                    None => InternalValue::new_tombstone(key, seqno),
+                };
+                size += item_size(&item);
+                (item.key, item.value)
+            })
+            .collect();
+
+        Self {
+            id,
+            items: Items::Sorted(items),
+            approximate_size: AtomicU64::new(size),
+            highest_seqno: AtomicU64::new(seqno),
+            requested_rotation: AtomicBool::default(),
+        }
+    }
+
     /// Creates an iterator over all items.
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = InternalValue> + '_ {
-        self.items.iter().map(|entry| InternalValue {
-            key: entry.key().clone(),
-            value: entry.value().clone(),
-        })
+        match &self.items {
+            Items::Skiplist(items) => Rows::Skiplist(items.iter().map(|entry| InternalValue {
+                key: entry.key().clone(),
+                value: entry.value().clone(),
+            })),
+            Items::Sorted(items) => Rows::Sorted(items.iter().map(row)),
+        }
     }
 
     /// Creates an iterator over a range of items.
@@ -80,10 +167,29 @@ impl Memtable {
         &'a self,
         range: R,
     ) -> impl DoubleEndedIterator<Item = InternalValue> + 'a {
-        self.items.range(range).map(|entry| InternalValue {
-            key: entry.key().clone(),
-            value: entry.value().clone(),
-        })
+        match &self.items {
+            Items::Skiplist(items) => {
+                Rows::Skiplist(items.range(range).map(|entry| InternalValue {
+                    key: entry.key().clone(),
+                    value: entry.value().clone(),
+                }))
+            }
+            Items::Sorted(items) => {
+                let start = match range.start_bound() {
+                    Bound::Included(bound) => items.partition_point(|(key, _)| key < bound),
+                    Bound::Excluded(bound) => items.partition_point(|(key, _)| key <= bound),
+                    Bound::Unbounded => 0,
+                };
+                let end = match range.end_bound() {
+                    Bound::Included(bound) => items.partition_point(|(key, _)| key <= bound),
+                    Bound::Excluded(bound) => items.partition_point(|(key, _)| key < bound),
+                    Bound::Unbounded => items.len(),
+                };
+
+                // A range whose end lies before its start holds nothing
+                Rows::Sorted(items.get(start..end).unwrap_or_default().iter().map(row))
+            }
+        }
     }
 
     /// Returns the item by key if it exists.
@@ -113,15 +219,22 @@ impl Memtable {
         //
         let lower_bound = InternalKey::new(key, seqno - 1, ValueType::Value);
 
-        let mut iter = self
-            .items
-            .range(lower_bound..)
-            .take_while(|entry| &*entry.key().user_key == key);
+        match &self.items {
+            Items::Skiplist(items) => {
+                let mut iter = items
+                    .range(lower_bound..)
+                    .take_while(|entry| &*entry.key().user_key == key);
 
-        iter.next().map(|entry| InternalValue {
-            key: entry.key().clone(),
-            value: entry.value().clone(),
-        })
+                iter.next().map(|entry| InternalValue {
+                    key: entry.key().clone(),
+                    value: entry.value().clone(),
+                })
+            }
+            Items::Sorted(items) => items
+                .get(items.partition_point(|(found, _)| found < &lower_bound))
+                .filter(|(found, _)| &*found.user_key == key)
+                .map(row),
+        }
     }
 
     /// Gets approximate size of memtable in bytes.
@@ -132,33 +245,37 @@ impl Memtable {
 
     /// Counts the number of items in the memtable.
     pub fn len(&self) -> usize {
-        self.items.len()
+        match &self.items {
+            Items::Skiplist(items) => items.len(),
+            Items::Sorted(items) => items.len(),
+        }
     }
 
     /// Returns `true` if the memtable is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.len() == 0
     }
 
     /// Inserts an item into the memtable
+    ///
+    /// # Panics
+    ///
+    /// Panics if the memtable was made from the rows of a batch: it is sealed from birth.
     #[doc(hidden)]
     pub fn insert(&self, item: InternalValue) -> (u64, u64) {
-        #[expect(
-            clippy::expect_used,
-            reason = "keys are limited to 16-bit length + values are limited to 32-bit length"
-        )]
-        let item_size =
-            (item.key.user_key.len() + item.value.len() + std::mem::size_of::<InternalValue>())
-                .try_into()
-                .expect("should fit into u64");
+        let Items::Skiplist(items) = &self.items else {
+            panic!("a memtable over the rows of a batch takes no further row");
+        };
+
+        let item_size = item_size(&item);
 
         let size_before = self
             .approximate_size
             .fetch_add(item_size, std::sync::atomic::Ordering::AcqRel);
 
         let key = InternalKey::new(item.key.user_key, item.key.seqno, item.key.value_type);
-        self.items.insert(key, item.value);
+        items.insert(key, item.value);
 
         self.highest_seqno
             .fetch_max(item.key.seqno, std::sync::atomic::Ordering::AcqRel);
@@ -176,6 +293,24 @@ impl Memtable {
                     .load(std::sync::atomic::Ordering::Acquire),
             )
         }
+    }
+}
+
+/// The bytes a memtable counts for one row.
+fn item_size(item: &InternalValue) -> u64 {
+    #[expect(
+        clippy::expect_used,
+        reason = "keys are limited to 16-bit length + values are limited to 32-bit length"
+    )]
+    (item.key.user_key.len() + item.value.len() + std::mem::size_of::<InternalValue>())
+        .try_into()
+        .expect("should fit into u64")
+}
+
+fn row((key, value): &(InternalKey, UserValue)) -> InternalValue {
+    InternalValue {
+        key: key.clone(),
+        value: value.clone(),
     }
 }
 
@@ -377,5 +512,66 @@ mod tests {
             )),
             memtable.get(b"abc", 50)
         );
+    }
+
+    #[test]
+    fn a_sorted_run_answers_as_a_skiplist_of_the_same_rows() {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+
+        let rows: Vec<(UserKey, Option<UserValue>)> = vec![
+            (b"a".into(), Some(b"1".into())),
+            (b"abc".into(), None),
+            (b"abd".into(), Some(b"3".into())),
+            (b"b".into(), Some(b"4".into())),
+        ];
+
+        let skiplist = Memtable::new(0);
+        for (key, value) in &rows {
+            skiplist.insert(match value {
+                Some(value) => {
+                    InternalValue::from_components(key.clone(), value.clone(), 7, ValueType::Value)
+                }
+                None => InternalValue::new_tombstone(key.clone(), 7),
+            });
+        }
+        let sorted = Memtable::from_sorted(1, rows, 7);
+
+        assert_eq!(skiplist.len(), sorted.len());
+        assert_eq!(skiplist.size(), sorted.size());
+        assert_eq!(skiplist.get_highest_seqno(), sorted.get_highest_seqno());
+        assert!(skiplist.iter().eq(sorted.iter()));
+        assert!(skiplist.iter().rev().eq(sorted.iter().rev()));
+
+        for key in [&b"a"[..], b"ab", b"abc", b"abd", b"b", b"c"] {
+            for seqno in [0, 7, 8, SeqNo::MAX] {
+                assert_eq!(
+                    skiplist.get(key, seqno),
+                    sorted.get(key, seqno),
+                    "{key:?} at {seqno}",
+                );
+            }
+        }
+
+        // A key's newest version sorts first, so `first` is before all of a key and `last` after
+        let first = |key: &[u8]| InternalKey::new(key, SeqNo::MAX, ValueType::Value);
+        let last = |key: &[u8]| InternalKey::new(key, 0, ValueType::Value);
+
+        let ranges = [
+            (Unbounded, Unbounded),
+            (Included(first(b"abc")), Unbounded),
+            (Excluded(last(b"abc")), Unbounded),
+            (Unbounded, Included(last(b"abd"))),
+            (Unbounded, Excluded(first(b"abd"))),
+            (Included(first(b"abc")), Included(last(b"abc"))),
+            (Included(first(b"c")), Unbounded),
+        ];
+
+        for range in ranges {
+            assert_eq!(
+                skiplist.range(range.clone()).collect::<Vec<_>>(),
+                sorted.range(range.clone()).collect::<Vec<_>>(),
+                "{range:?}",
+            );
+        }
     }
 }
