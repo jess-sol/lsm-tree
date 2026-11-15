@@ -12,7 +12,7 @@ mod super_version;
 pub use blob_file_list::BlobFileList;
 pub use persist::persist_version;
 pub use run::Run;
-pub use super_version::{SuperVersion, SuperVersions};
+pub use super_version::SuperVersion;
 
 use crate::blob_tree::{FragmentationEntry, FragmentationMap};
 use crate::checksum::ChecksumType;

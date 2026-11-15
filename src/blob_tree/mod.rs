@@ -174,10 +174,10 @@ impl AbstractTree for BlobTree {
         self.index.table_file_cache_size()
     }
 
-    fn get_version_history_lock(
+    fn get_super_version_lock(
         &self,
-    ) -> std::sync::RwLockWriteGuard<'_, crate::version::SuperVersions> {
-        self.index.get_version_history_lock()
+    ) -> std::sync::RwLockWriteGuard<'_, crate::version::SuperVersion> {
+        self.index.get_super_version_lock()
     }
 
     fn next_table_id(&self) -> TableId {
@@ -201,10 +201,6 @@ impl AbstractTree for BlobTree {
         self.index.metrics()
     }
 
-    fn version_free_list_len(&self) -> usize {
-        self.index.version_free_list_len()
-    }
-
     fn prefix<K: AsRef<[u8]>>(
         &self,
         prefix: K,
@@ -213,7 +209,7 @@ impl AbstractTree for BlobTree {
     ) -> Box<dyn DoubleEndedIterator<Item = IterGuardImpl> + Send + 'static> {
         use crate::range::prefix_to_range;
 
-        let super_version = self.index.get_version_for_snapshot(seqno);
+        let super_version = self.index.current_super_version();
         let tree = self.clone();
 
         let range = prefix_to_range(prefix.as_ref());
@@ -237,7 +233,7 @@ impl AbstractTree for BlobTree {
         seqno: SeqNo,
         index: Option<(Arc<Memtable>, SeqNo)>,
     ) -> Box<dyn DoubleEndedIterator<Item = IterGuardImpl> + Send + 'static> {
-        let super_version = self.index.get_version_for_snapshot(seqno);
+        let super_version = self.index.current_super_version();
         let tree = self.clone();
 
         Box::new(
@@ -271,21 +267,15 @@ impl AbstractTree for BlobTree {
 
     fn clear(&self) -> crate::Result<()> {
         let config = self.tree_config();
-        let mut versions = self.get_version_history_lock();
+        let mut super_version = self.get_super_version_lock();
 
-        versions.upgrade_version(
-            &config.path,
-            |v| {
-                let mut copy = v.clone();
-                copy.active_memtable =
-                    Arc::new(Memtable::new(self.index.memtable_id_counter.next()));
-                copy.sealed_memtables = Arc::default();
-                copy.version = Version::new(v.version.id() + 1, self.tree_type());
-                Ok(copy)
-            },
-            &config.seqno,
-            &config.visible_seqno,
-        )
+        super_version.upgrade_version(&config.path, |v| {
+            let mut copy = v.clone();
+            copy.active_memtable = Arc::new(Memtable::new(self.index.memtable_id_counter.next()));
+            copy.sealed_memtables = Arc::default();
+            copy.version = Version::new(v.version.id() + 1, self.tree_type());
+            Ok(copy)
+        })
     }
 
     fn major_compact(&self, target_size: u64, seqno_threshold: SeqNo) -> crate::Result<()> {
@@ -505,15 +495,9 @@ impl AbstractTree for BlobTree {
         blob_files: Option<&[BlobFile]>,
         frag_map: Option<FragmentationMap>,
         sealed_memtables_to_delete: &[MemtableId],
-        gc_watermark: SeqNo,
     ) -> crate::Result<()> {
-        self.index.register_tables(
-            tables,
-            blob_files,
-            frag_map,
-            sealed_memtables_to_delete,
-            gc_watermark,
-        )
+        self.index
+            .register_tables(tables, blob_files, frag_map, sealed_memtables_to_delete)
     }
 
     fn compact(
@@ -599,13 +583,7 @@ impl AbstractTree for BlobTree {
     fn get<K: AsRef<[u8]>>(&self, key: K, seqno: SeqNo) -> crate::Result<Option<crate::UserValue>> {
         let key = key.as_ref();
 
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let super_version = self
-            .index
-            .version_history
-            .read()
-            .expect("lock is poisoned")
-            .get_version_for_snapshot(seqno);
+        let super_version = self.index.current_super_version();
 
         let Some(item) = crate::Tree::get_internal_entry_from_version(&super_version, key, seqno)?
         else {

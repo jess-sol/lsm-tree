@@ -18,7 +18,7 @@ use crate::{
     slice::Slice,
     table::Table,
     value::InternalValue,
-    version::{recovery::recover, SuperVersion, SuperVersions, Version},
+    version::{recovery::recover, SuperVersion, Version},
     vlog::BlobFile,
     AbstractTree, Checksum, KvPair, SeqNo, SequenceNumberCounter, TableId, UserKey, UserValue,
     ValueType,
@@ -92,11 +92,9 @@ impl AbstractTree for Tree {
             .map_or(0, |dt| dt.len())
     }
 
-    fn get_version_history_lock(
-        &self,
-    ) -> std::sync::RwLockWriteGuard<'_, crate::version::SuperVersions> {
+    fn get_super_version_lock(&self) -> std::sync::RwLockWriteGuard<'_, SuperVersion> {
         #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        self.version_history.write().expect("lock is poisoned")
+        self.super_version.write().expect("lock is poisoned")
     }
 
     fn next_table_id(&self) -> TableId {
@@ -112,12 +110,7 @@ impl AbstractTree for Tree {
     }
 
     fn print_trace(&self, key: &[u8]) -> crate::Result<()> {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let super_version = self
-            .version_history
-            .read()
-            .expect("lock is poisoned")
-            .latest_version();
+        let super_version = self.current_super_version();
 
         let key = Slice::from(key);
 
@@ -155,23 +148,11 @@ impl AbstractTree for Tree {
     }
 
     fn get_internal_entry(&self, key: &[u8], seqno: SeqNo) -> crate::Result<Option<InternalValue>> {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let super_version = self
-            .version_history
-            .read()
-            .expect("lock is poisoned")
-            .get_version_for_snapshot(seqno);
-
-        Self::get_internal_entry_from_version(&super_version, key, seqno)
+        Self::get_internal_entry_from_version(&self.current_super_version(), key, seqno)
     }
 
     fn current_version(&self) -> Version {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        self.version_history
-            .read()
-            .expect("poisoned")
-            .latest_version()
-            .version
+        self.current_super_version().version
     }
 
     fn get_flush_lock(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -182,14 +163,6 @@ impl AbstractTree for Tree {
     #[cfg(feature = "metrics")]
     fn metrics(&self) -> &Arc<crate::Metrics> {
         &self.0.metrics
-    }
-
-    fn version_free_list_len(&self) -> usize {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        self.version_history
-            .read()
-            .expect("lock is poisoned")
-            .free_list_len()
     }
 
     fn prefix<K: AsRef<[u8]>>(
@@ -263,20 +236,15 @@ impl AbstractTree for Tree {
 
     fn clear(&self) -> crate::Result<()> {
         let config = self.tree_config();
-        let mut versions = self.get_version_history_lock();
+        let mut super_version = self.get_super_version_lock();
 
-        versions.upgrade_version(
-            &config.path,
-            |v| {
-                let mut copy = v.clone();
-                copy.active_memtable = Arc::new(Memtable::new(self.memtable_id_counter.next()));
-                copy.sealed_memtables = Arc::default();
-                copy.version = Version::new(v.version.id() + 1, self.tree_type());
-                Ok(copy)
-            },
-            &config.seqno,
-            &config.visible_seqno,
-        )
+        super_version.upgrade_version(&config.path, |v| {
+            let mut copy = v.clone();
+            copy.active_memtable = Arc::new(Memtable::new(self.memtable_id_counter.next()));
+            copy.sealed_memtables = Arc::default();
+            copy.version = Version::new(v.version.id() + 1, self.tree_type());
+            Ok(copy)
+        })
     }
 
     #[doc(hidden)]
@@ -331,10 +299,9 @@ impl AbstractTree for Tree {
 
     fn sealed_memtable_count(&self) -> usize {
         #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        self.version_history
+        self.super_version
             .read()
             .expect("lock is poisoned")
-            .latest_version()
             .sealed_memtables
             .len()
     }
@@ -430,14 +397,12 @@ impl AbstractTree for Tree {
         Ok(Some((tables, None)))
     }
 
-    #[expect(clippy::significant_drop_tightening)]
     fn register_tables(
         &self,
         tables: &[Table],
         blob_files: Option<&[BlobFile]>,
         frag_map: Option<crate::blob_tree::FragmentationMap>,
         sealed_memtables_to_delete: &[crate::tree::inner::MemtableId],
-        gc_watermark: SeqNo,
     ) -> crate::Result<()> {
         log::trace!(
             "Registering {} tables, {} blob files",
@@ -448,66 +413,48 @@ impl AbstractTree for Tree {
         #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
         let mut _compaction_state = self.compaction_state.lock().expect("lock is poisoned");
         #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let mut version_lock = self.version_history.write().expect("lock is poisoned");
+        let mut super_version = self.super_version.write().expect("lock is poisoned");
 
         // NOTE: Check for race condition
         // Fixes: https://github.com/fjall-rs/fjall/issues/287#issuecomment-4938188362
         if sealed_memtables_to_delete
             .iter()
-            .any(|id| !version_lock.latest_version().sealed_memtables.contains(id))
+            .any(|id| !super_version.sealed_memtables.contains(id))
         {
             log::debug!("Not registering tables because flush task processed some sealed memtables which do not exist (anymore)");
             return Ok(());
         }
 
-        version_lock.upgrade_version(
-            &self.config.path,
-            |current| {
-                let mut copy = current.clone();
+        super_version.upgrade_version(&self.config.path, |current| {
+            let mut copy = current.clone();
 
-                copy.version = copy.version.with_new_l0_run(
-                    tables,
-                    blob_files,
-                    frag_map.filter(|x| !x.is_empty()),
-                );
+            copy.version = copy.version.with_new_l0_run(
+                tables,
+                blob_files,
+                frag_map.filter(|x| !x.is_empty()),
+            );
 
-                for &table_id in sealed_memtables_to_delete {
-                    log::trace!("releasing sealed memtable #{table_id}");
-                    copy.sealed_memtables = Arc::new(copy.sealed_memtables.remove(table_id));
-                }
+            for &table_id in sealed_memtables_to_delete {
+                log::trace!("releasing sealed memtable #{table_id}");
+                copy.sealed_memtables = Arc::new(copy.sealed_memtables.remove(table_id));
+            }
 
-                Ok(copy)
-            },
-            &self.config.seqno,
-            &self.config.visible_seqno,
-        )?;
-
-        if let Err(e) = version_lock.maintenance(&self.config.path, gc_watermark) {
-            log::warn!("Version GC failed: {e:?}");
-        }
-
-        Ok(())
+            Ok(copy)
+        })
     }
 
     fn clear_active_memtable(&self) {
         use crate::tree::sealed::SealedMemtables;
 
         #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let mut version_history_lock = self.version_history.write().expect("lock is poisoned");
-        let super_version = version_history_lock.latest_version();
+        let mut super_version = self.super_version.write().expect("lock is poisoned");
 
         if super_version.active_memtable.is_empty() {
             return;
         }
 
-        let mut copy = version_history_lock.latest_version();
-        copy.active_memtable = Arc::new(Memtable::new(self.memtable_id_counter.next()));
-        copy.sealed_memtables = Arc::new(SealedMemtables::default());
-
-        // Clear active is only used for recovery where snapshots do not exist yet
-        copy.seqno = super_version.seqno;
-
-        version_history_lock.replace_latest_version(copy);
+        super_version.active_memtable = Arc::new(Memtable::new(self.memtable_id_counter.next()));
+        super_version.sealed_memtables = Arc::new(SealedMemtables::default());
 
         log::trace!("cleared active memtable");
     }
@@ -540,34 +487,28 @@ impl AbstractTree for Tree {
 
     fn active_memtable(&self) -> Arc<Memtable> {
         #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        self.version_history
+        self.super_version
             .read()
             .expect("lock is poisoned")
-            .latest_version()
             .active_memtable
+            .clone()
     }
 
     #[expect(clippy::significant_drop_tightening)]
     fn rotate_memtable(&self) -> Option<Arc<Memtable>> {
         #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let mut version_history_lock = self.version_history.write().expect("lock is poisoned");
-        let super_version = version_history_lock.latest_version();
+        let mut super_version = self.super_version.write().expect("lock is poisoned");
 
         if super_version.active_memtable.is_empty() {
             return None;
         }
 
-        let yanked_memtable = super_version.active_memtable;
-
-        let mut copy = version_history_lock.latest_version();
-        copy.active_memtable = Arc::new(Memtable::new(self.memtable_id_counter.next()));
-        copy.sealed_memtables =
+        let yanked_memtable = std::mem::replace(
+            &mut super_version.active_memtable,
+            Arc::new(Memtable::new(self.memtable_id_counter.next())),
+        );
+        super_version.sealed_memtables =
             Arc::new(super_version.sealed_memtables.add(yanked_memtable.clone()));
-
-        // Rotate does not modify the memtable so it cannot break snapshots
-        copy.seqno = super_version.seqno;
-
-        version_history_lock.replace_latest_version(copy);
 
         log::trace!(
             "rotate: added memtable id={} to sealed memtables",
@@ -586,12 +527,7 @@ impl AbstractTree for Tree {
     }
 
     fn approximate_len(&self) -> usize {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let super_version = self
-            .version_history
-            .read()
-            .expect("lock is poisoned")
-            .latest_version();
+        let super_version = self.current_super_version();
 
         let tables_item_count = self
             .current_version()
@@ -620,12 +556,7 @@ impl AbstractTree for Tree {
     }
 
     fn get_highest_memtable_seqno(&self) -> Option<SeqNo> {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let version = self
-            .version_history
-            .read()
-            .expect("lock is poisoned")
-            .latest_version();
+        let version = self.current_super_version();
 
         let active = version.active_memtable.get_highest_seqno();
 
@@ -759,12 +690,10 @@ impl Tree {
         None
     }
 
-    pub(crate) fn get_version_for_snapshot(&self, seqno: SeqNo) -> SuperVersion {
+    /// The memtables and tables every read begins on.
+    pub(crate) fn current_super_version(&self) -> SuperVersion {
         #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        self.version_history
-            .read()
-            .expect("lock is poisoned")
-            .get_version_for_snapshot(seqno)
+        self.super_version.read().expect("lock is poisoned").clone()
     }
 
     /// Normalizes a user-provided range into owned `Bound<Slice>` values.
@@ -880,12 +809,7 @@ impl Tree {
         seqno: SeqNo,
         ephemeral: Option<(Arc<Memtable>, SeqNo)>,
     ) -> impl DoubleEndedIterator<Item = crate::Result<KvPair>> + 'static {
-        #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let super_version = self
-            .version_history
-            .read()
-            .expect("lock is poisoned")
-            .get_version_for_snapshot(seqno);
+        let super_version = self.current_super_version();
 
         Self::create_internal_range(super_version, range, seqno, ephemeral).map(|item| match item {
             Ok(kv) => Ok((kv.key.user_key, kv.value)),
@@ -913,10 +837,9 @@ impl Tree {
     #[must_use]
     pub fn append_entry(&self, value: InternalValue) -> (u64, u64) {
         #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        self.version_history
+        self.super_version
             .read()
             .expect("lock is poisoned")
-            .latest_version()
             .active_memtable
             .insert(value)
     }
@@ -992,7 +915,7 @@ impl Tree {
             memtable_id_counter: SequenceNumberCounter::new(1),
             table_id_counter: SequenceNumberCounter::new(highest_table_id + 1),
             blob_file_id_counter: SequenceNumberCounter::default(),
-            version_history: Arc::new(RwLock::new(SuperVersions::new(version))),
+            super_version: Arc::new(RwLock::new(SuperVersion::new(version))),
             stop_signal: StopSignal::default(),
             config: Arc::new(config),
             major_compaction_lock: RwLock::default(),

@@ -232,11 +232,13 @@ pub struct Config {
     #[doc(hidden)]
     pub kv_separation_opts: Option<KvSeparationOptions>,
 
-    /// The global sequence number generator
+    /// The sequence number generator of the caller
     ///
-    /// Should be shared between multple trees of a database
+    /// The tree draws from it only for the rows of a bulk ingestion; every other
+    /// row carries the seqno its write was given
     pub(crate) seqno: SequenceNumberCounter,
 
+    /// Where a bulk ingestion publishes the seqno of its rows
     pub(crate) visible_seqno: SequenceNumberCounter,
 }
 

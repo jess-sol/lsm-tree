@@ -196,16 +196,16 @@ impl<'a> BlobIngestion<'a> {
         let results = self.table.writer.finish()?;
 
         // Acquire locks for version registration on the index tree. We must
-        // hold both the compaction state lock and version history lock to
+        // hold both the compaction state lock and super version lock to
         // safely modify the tree's version.
         #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
         let mut _compaction_state = index.compaction_state.lock().expect("lock is poisoned");
         #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let mut version_lock = index.version_history.write().expect("lock is poisoned");
+        let mut super_version = index.super_version.write().expect("lock is poisoned");
 
         // Allocate the next global sequence number. This seqno will be shared
-        // by all ingested tables, blob files, and the version that registers
-        // them, ensuring consistent MVCC snapshots across the value log.
+        // by all ingested tables and blob files, ensuring consistent MVCC
+        // snapshots across the value log.
         let global_seqno = index.config.seqno.next();
 
         // Recover all created index tables, assigning them the global_seqno
@@ -238,33 +238,17 @@ impl<'a> BlobIngestion<'a> {
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
-        // Upgrade the version with our ingested tables and blob files, using
-        // the global_seqno we allocated earlier. This ensures the version,
-        // tables, and blob files all share the same sequence number, which is
-        // critical for GC correctness - we must not delete blob files that are
-        // still referenced by visible snapshots.
-        //
-        // We use upgrade_version_with_seqno (instead of upgrade_version) because
-        // we need precise control over the seqno: it must match the seqno we
-        // already assigned to the recovered tables.
-        version_lock.upgrade_version_with_seqno(
-            &index.config.path,
-            |current| {
-                let mut copy = current.clone();
-                copy.version =
-                    copy.version
-                        .with_new_l0_run(&created_tables, Some(&blob_files), None);
-                Ok(copy)
-            },
-            global_seqno,
-            &self.tree.index.config.visible_seqno,
-        )?;
+        // Upgrade the version with our ingested tables and blob files, then
+        // publish the seqno their rows carry.
+        super_version.upgrade_version(&index.config.path, |current| {
+            let mut copy = current.clone();
+            copy.version = copy
+                .version
+                .with_new_l0_run(&created_tables, Some(&blob_files), None);
+            Ok(copy)
+        })?;
 
-        // Perform maintenance on the version history (e.g., clean up old versions).
-        // We use gc_watermark=0 since ingestion doesn't affect sealed memtables.
-        if let Err(e) = version_lock.maintenance(&index.config.path, 0) {
-            log::warn!("Version GC failed: {e:?}");
-        }
+        index.config.visible_seqno.fetch_max(global_seqno + 1);
 
         Ok(())
     }

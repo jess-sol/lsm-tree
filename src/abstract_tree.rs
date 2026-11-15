@@ -28,7 +28,7 @@ pub trait AbstractTree {
     // TODO: remove
     #[doc(hidden)]
     fn version_memtable_size_sum(&self) -> u64 {
-        self.get_version_history_lock().memtable_size_sum()
+        self.get_super_version_lock().memtable_size_sum()
     }
 
     #[doc(hidden)]
@@ -47,7 +47,7 @@ pub trait AbstractTree {
     fn current_version(&self) -> Version;
 
     #[doc(hidden)]
-    fn get_version_history_lock(&self) -> RwLockWriteGuard<'_, crate::version::SuperVersions>;
+    fn get_super_version_lock(&self) -> RwLockWriteGuard<'_, crate::version::SuperVersion>;
 
     /// Seals the active memtable and flushes to table(s).
     ///
@@ -78,8 +78,7 @@ pub trait AbstractTree {
     ) -> crate::Result<Option<u64>> {
         use crate::{compaction::stream::CompactionStream, merge::Merger};
 
-        let version_history = self.get_version_history_lock();
-        let latest = version_history.latest_version();
+        let latest = self.get_super_version_lock().clone();
 
         if latest.sealed_memtables.len() == 0 {
             return Ok(None);
@@ -104,16 +103,8 @@ pub trait AbstractTree {
         );
         let stream = CompactionStream::new(merger, seqno_threshold);
 
-        drop(version_history);
-
         if let Some((tables, blob_files)) = self.flush_to_tables(stream)? {
-            self.register_tables(
-                &tables,
-                blob_files.as_deref(),
-                None,
-                &sealed_ids,
-                seqno_threshold,
-            )?;
+            self.register_tables(&tables, blob_files.as_deref(), None, &sealed_ids)?;
         }
 
         Ok(Some(flushed_size))
@@ -200,9 +191,6 @@ pub trait AbstractTree {
     /// Gets the memory usage of all pinned index blocks in the tree.
     fn pinned_block_index_size(&self) -> usize;
 
-    /// Gets the length of the version free list.
-    fn version_free_list_len(&self) -> usize;
-
     /// Returns the metrics structure.
     #[cfg(feature = "metrics")]
     fn metrics(&self) -> &Arc<crate::Metrics>;
@@ -235,7 +223,6 @@ pub trait AbstractTree {
         blob_files: Option<&[BlobFile]>,
         frag_map: Option<crate::blob_tree::FragmentationMap>,
         sealed_memtables_to_delete: &[crate::tree::inner::MemtableId],
-        gc_watermark: SeqNo,
     ) -> crate::Result<()>;
 
     /// Clears the active memtable atomically.

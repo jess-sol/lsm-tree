@@ -268,17 +268,16 @@ impl<'a> Ingestion<'a> {
         log::info!("Finished ingestion writer");
 
         // Acquire locks for version registration. We must hold both the
-        // compaction state lock and version history lock to safely modify
+        // compaction state lock and super version lock to safely modify
         // the tree's version.
         #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
         let mut _compaction_state = self.tree.compaction_state.lock().expect("lock is poisoned");
 
         #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-        let mut version_lock = self.tree.version_history.write().expect("lock is poisoned");
+        let mut super_version = self.tree.super_version.write().expect("lock is poisoned");
 
         // Allocate the next global sequence number. This seqno will be shared
-        // by all ingested tables and the version that registers them, ensuring
-        // consistent MVCC snapshots.
+        // by all ingested tables, ensuring consistent MVCC snapshots.
         let global_seqno = self.tree.config.seqno.next();
 
         // Recover all created tables, assigning them the global_seqno we just
@@ -306,29 +305,15 @@ impl<'a> Ingestion<'a> {
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
-        // Upgrade the version with our ingested tables, using the global_seqno
-        // we allocated earlier. This ensures the version and all tables share
-        // the same sequence number.
-        //
-        // We use upgrade_version_with_seqno (instead of upgrade_version) because
-        // we need precise control over the seqno: it must match the seqno we
-        // already assigned to the recovered tables.
-        version_lock.upgrade_version_with_seqno(
-            &self.tree.config.path,
-            |current| {
-                let mut copy = current.clone();
-                copy.version = copy.version.with_new_l0_run(&created_tables, None, None);
-                Ok(copy)
-            },
-            global_seqno,
-            &self.tree.config.visible_seqno,
-        )?;
+        // Upgrade the version with our ingested tables, then publish the seqno
+        // their rows carry.
+        super_version.upgrade_version(&self.tree.config.path, |current| {
+            let mut copy = current.clone();
+            copy.version = copy.version.with_new_l0_run(&created_tables, None, None);
+            Ok(copy)
+        })?;
 
-        // Perform maintenance on the version history (e.g., clean up old versions).
-        // We use gc_watermark=0 since ingestion doesn't affect sealed memtables.
-        if let Err(e) = version_lock.maintenance(&self.tree.config.path, 0) {
-            log::warn!("Version GC failed: {e:?}");
-        }
+        self.tree.config.visible_seqno.fetch_max(global_seqno + 1);
 
         Ok(())
     }

@@ -9,7 +9,7 @@ use crate::compaction::worker::Options;
 use crate::compaction::Input as CompactionPayload;
 use crate::file::TABLES_FOLDER;
 use crate::table::multi_writer::MultiWriter;
-use crate::version::{SuperVersions, Version};
+use crate::version::{SuperVersion, Version};
 use crate::vlog::blob_file::scanner::ScanEntry;
 use crate::vlog::{BlobFileId, BlobFileMergeScanner, BlobFileWriter};
 use crate::{BlobFile, HashSet, InternalValue, Table};
@@ -123,7 +123,7 @@ pub(super) trait CompactionFlavour {
     #[warn(clippy::too_many_arguments)]
     fn finish(
         self: Box<Self>,
-        super_version: &mut SuperVersions,
+        super_version: &mut SuperVersion,
         opts: &Options,
         payload: &CompactionPayload,
         dst_lvl: usize,
@@ -257,7 +257,7 @@ impl CompactionFlavour for RelocatingCompaction {
 
     fn finish(
         mut self: Box<Self>,
-        super_version: &mut SuperVersions,
+        super_version: &mut SuperVersion,
         opts: &Options,
         payload: &CompactionPayload,
         dst_lvl: usize,
@@ -277,7 +277,7 @@ impl CompactionFlavour for RelocatingCompaction {
 
         let mut blob_files_to_drop = self.rewriting_blob_files;
 
-        let current_version = super_version.latest_version();
+        let current_version = super_version.clone();
 
         for blob_file in current_version.version.blob_files.iter() {
             if blob_file.is_dead(current_version.version.gc_stats()) {
@@ -285,32 +285,27 @@ impl CompactionFlavour for RelocatingCompaction {
             }
         }
 
-        super_version.upgrade_version(
-            &opts.config.path,
-            |current| {
-                let mut copy = current.clone();
+        super_version.upgrade_version(&opts.config.path, |current| {
+            let mut copy = current.clone();
 
-                copy.version = copy.version.with_merge(
-                    &payload.table_ids.iter().copied().collect::<Vec<_>>(),
-                    &created_tables,
-                    payload.dest_level as usize,
-                    if blob_frag_map_diff.is_empty() {
-                        None
-                    } else {
-                        Some(blob_frag_map_diff)
-                    },
-                    created_blob_files,
-                    &blob_files_to_drop
-                        .iter()
-                        .map(BlobFile::id)
-                        .collect::<HashSet<_>>(),
-                );
+            copy.version = copy.version.with_merge(
+                &payload.table_ids.iter().copied().collect::<Vec<_>>(),
+                &created_tables,
+                payload.dest_level as usize,
+                if blob_frag_map_diff.is_empty() {
+                    None
+                } else {
+                    Some(blob_frag_map_diff)
+                },
+                created_blob_files,
+                &blob_files_to_drop
+                    .iter()
+                    .map(BlobFile::id)
+                    .collect::<HashSet<_>>(),
+            );
 
-                Ok(copy)
-            },
-            &opts.global_seqno,
-            &opts.visible_seqno,
-        )?;
+            Ok(copy)
+        })?;
 
         // NOTE: If the application were to crash >here< it's fine
         // The tables/blob files are not referenced anymore, and will be
@@ -392,7 +387,7 @@ impl CompactionFlavour for StandardCompaction {
 
     fn finish(
         mut self: Box<Self>,
-        super_version: &mut SuperVersions,
+        super_version: &mut SuperVersion,
         opts: &Options,
         payload: &CompactionPayload,
         dst_lvl: usize,
@@ -407,7 +402,7 @@ impl CompactionFlavour for StandardCompaction {
 
         let mut blob_files_to_drop = Vec::default();
 
-        let current_version = super_version.latest_version();
+        let current_version = super_version.clone();
 
         for blob_file in current_version.version.blob_files.iter() {
             if blob_file.is_dead(current_version.version.gc_stats()) {
@@ -415,32 +410,27 @@ impl CompactionFlavour for StandardCompaction {
             }
         }
 
-        super_version.upgrade_version(
-            &opts.config.path,
-            |current| {
-                let mut copy = current.clone();
+        super_version.upgrade_version(&opts.config.path, |current| {
+            let mut copy = current.clone();
 
-                copy.version = copy.version.with_merge(
-                    &payload.table_ids.iter().copied().collect::<Vec<_>>(),
-                    &created_tables,
-                    payload.dest_level as usize,
-                    if blob_frag_map.is_empty() {
-                        None
-                    } else {
-                        Some(blob_frag_map)
-                    },
-                    extra_blob_files,
-                    &blob_files_to_drop
-                        .iter()
-                        .map(BlobFile::id)
-                        .collect::<HashSet<_>>(),
-                );
+            copy.version = copy.version.with_merge(
+                &payload.table_ids.iter().copied().collect::<Vec<_>>(),
+                &created_tables,
+                payload.dest_level as usize,
+                if blob_frag_map.is_empty() {
+                    None
+                } else {
+                    Some(blob_frag_map)
+                },
+                extra_blob_files,
+                &blob_files_to_drop
+                    .iter()
+                    .map(BlobFile::id)
+                    .collect::<HashSet<_>>(),
+            );
 
-                Ok(copy)
-            },
-            &opts.global_seqno,
-            &opts.visible_seqno,
-        )?;
+            Ok(copy)
+        })?;
 
         // NOTE: If the application were to crash >here< it's fine
         // The tables are not referenced anymore, and will be

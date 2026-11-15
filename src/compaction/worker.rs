@@ -17,7 +17,7 @@ use crate::{
     run_scanner::RunScanner,
     stop_signal::StopSignal,
     tree::inner::TreeId,
-    version::{Run, SuperVersions, Version},
+    version::{Run, SuperVersion, Version},
     vlog::{BlobFileMergeScanner, BlobFileScanner, BlobFileWriter},
     BlobFile, Config, HashSet, InternalValue, SeqNo, SequenceNumberCounter, Table, TableId,
 };
@@ -35,10 +35,6 @@ pub type CompactionReader<'a> = Box<dyn Iterator<Item = crate::Result<InternalVa
 pub struct Options {
     pub tree_id: TreeId,
 
-    pub global_seqno: SequenceNumberCounter,
-
-    pub visible_seqno: SequenceNumberCounter,
-
     pub table_id_generator: SequenceNumberCounter,
 
     pub blob_file_id_generator: SequenceNumberCounter,
@@ -46,7 +42,7 @@ pub struct Options {
     /// Configuration of tree.
     pub config: Arc<Config>,
 
-    pub version_history: Arc<RwLock<SuperVersions>>,
+    pub super_version: Arc<RwLock<SuperVersion>>,
 
     /// Compaction strategy to use.
     pub strategy: Arc<dyn CompactionStrategy>,
@@ -67,13 +63,11 @@ pub struct Options {
 impl Options {
     pub fn from_tree(tree: &crate::Tree, strategy: Arc<dyn CompactionStrategy>) -> Self {
         Self {
-            global_seqno: tree.config.seqno.clone(),
-            visible_seqno: tree.config.visible_seqno.clone(),
             tree_id: tree.id,
             table_id_generator: tree.table_id_counter.clone(),
             blob_file_id_generator: tree.blob_file_id_counter.clone(),
             config: tree.config.clone(),
-            version_history: tree.version_history.clone(),
+            super_version: tree.super_version.clone(),
             stop_signal: tree.stop_signal.clone(),
             strategy,
             mvcc_gc_watermark: 0,
@@ -94,32 +88,28 @@ pub fn do_compaction(opts: &Options) -> crate::Result<()> {
     let compaction_state = opts.compaction_state.lock().expect("lock is poisoned");
 
     #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-    let version_history_lock = opts.version_history.read().expect("lock is poisoned");
+    let super_version = opts.super_version.read().expect("lock is poisoned");
 
     let start = Instant::now();
     log::trace!(
         "Consulting compaction strategy {:?}",
         opts.strategy.get_name(),
     );
-    let choice = opts.strategy.choose(
-        &version_history_lock.latest_version().version,
-        &opts.config,
-        &compaction_state,
-    );
+    let choice = opts
+        .strategy
+        .choose(&super_version.version, &opts.config, &compaction_state);
 
     log::debug!("Compaction choice: {choice:?} in {:?}", start.elapsed());
 
     match choice {
-        Choice::Merge(payload) => {
-            merge_tables(compaction_state, version_history_lock, opts, &payload)
-        }
+        Choice::Merge(payload) => merge_tables(compaction_state, super_version, opts, &payload),
         Choice::Move(payload) => {
-            drop(version_history_lock);
+            drop(super_version);
 
             move_tables(&compaction_state, opts, &payload)
         }
         Choice::Drop(payload) => {
-            drop(version_history_lock);
+            drop(super_version);
 
             drop_tables(
                 compaction_state,
@@ -188,7 +178,7 @@ fn move_tables(
     payload: &CompactionPayload,
 ) -> crate::Result<()> {
     #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-    let mut version_history_lock = opts.version_history.write().expect("lock is poisoned");
+    let mut super_version = opts.super_version.write().expect("lock is poisoned");
 
     // Fail-safe for buggy compaction strategies
     if compaction_state
@@ -210,40 +200,25 @@ fn move_tables(
     // this write lock, so the version may have been swapped out in between (`clear()` for
     // example installs a brand new, empty version).
     // `Version::with_moved` asserts that every input table is still present, so committing a
-    // stale move would panic while holding both the compaction state mutex and the version
-    // history write lock, poisoning them.
-    if table_ids.iter().any(|&id| {
-        version_history_lock
-            .latest_version()
-            .version
-            .get_table(id)
-            .is_none()
-    }) {
+    // stale move would panic while holding both the compaction state mutex and the super
+    // version write lock, poisoning them.
+    if table_ids
+        .iter()
+        .any(|&id| super_version.version.get_table(id).is_none())
+    {
         log::debug!("{table_ids:?} are not referenced anymore; skipping move");
         return Ok(());
     }
 
-    version_history_lock.upgrade_version(
-        &opts.config.path,
-        |current| {
-            let mut copy = current.clone();
+    super_version.upgrade_version(&opts.config.path, |current| {
+        let mut copy = current.clone();
 
-            copy.version = copy
-                .version
-                .with_moved(&table_ids, payload.dest_level as usize);
+        copy.version = copy
+            .version
+            .with_moved(&table_ids, payload.dest_level as usize);
 
-            Ok(copy)
-        },
-        &opts.global_seqno,
-        &opts.visible_seqno,
-    )?;
-
-    if let Err(e) = version_history_lock.maintenance(&opts.config.path, opts.mvcc_gc_watermark) {
-        log::error!("Manifest maintenance failed: {e:?}");
-        return Err(e);
-    }
-
-    Ok(())
+        Ok(copy)
+    })
 }
 
 /// Picks blob files to rewrite (defragment)
@@ -348,7 +323,7 @@ fn hidden_guard<T>(
 #[expect(clippy::too_many_lines)]
 fn merge_tables(
     mut compaction_state: MutexGuard<'_, CompactionState>,
-    version_history_lock: RwLockReadGuard<'_, SuperVersions>,
+    super_version_lock: RwLockReadGuard<'_, SuperVersion>,
     opts: &Options,
     payload: &CompactionPayload,
 ) -> crate::Result<()> {
@@ -369,7 +344,7 @@ fn merge_tables(
         return Ok(());
     }
 
-    let current_super_version = version_history_lock.latest_version();
+    let current_super_version = super_version_lock.clone();
 
     let Some(tables) = payload
         .table_ids
@@ -496,7 +471,7 @@ fn merge_tables(
 
     log::trace!("Blob file GC preparation done in {:?}", start.elapsed());
 
-    drop(version_history_lock);
+    drop(super_version_lock);
 
     {
         compaction_state
@@ -531,7 +506,7 @@ fn merge_tables(
 
     log::trace!("Acquiring super version write lock");
     #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-    let mut version_history_lock = opts.version_history.write().expect("lock is poisoned");
+    let mut super_version = opts.super_version.write().expect("lock is poisoned");
     log::trace!("Acquired super version write lock");
 
     // NOTE: Check for race condition - https://github.com/fjall-rs/fjall/issues/287
@@ -540,13 +515,11 @@ fn merge_tables(
     // in the meantime (`clear()` for example installs a brand new, empty version).
     // Committing the merge result would then insert the compacted tables into a version that no longer
     // references their inputs, resurrecting data that was already logically removed.
-    if payload.table_ids.iter().any(|&id| {
-        version_history_lock
-            .latest_version()
-            .version
-            .get_table(id)
-            .is_none()
-    }) {
+    if payload
+        .table_ids
+        .iter()
+        .any(|&id| super_version.version.get_table(id).is_none())
+    {
         log::debug!("Input table(s) are not referenced anymore; skipping result installation");
 
         compaction_state
@@ -574,7 +547,7 @@ fn merge_tables(
 
     compactor
         .finish(
-            &mut version_history_lock,
+            &mut super_version,
             opts,
             payload,
             dst_lvl,
@@ -595,13 +568,7 @@ fn merge_tables(
         .hidden_set_mut()
         .show(payload.table_ids.iter().copied());
 
-    version_history_lock
-        .maintenance(&opts.config.path, opts.mvcc_gc_watermark)
-        .inspect_err(|e| {
-            log::error!("Manifest maintenance failed: {e:?}");
-        })?;
-
-    drop(version_history_lock);
+    drop(super_version);
     drop(compaction_state);
 
     log::trace!("Compaction successful");
@@ -615,7 +582,7 @@ fn drop_tables(
     ids_to_drop: &[TableId],
 ) -> crate::Result<()> {
     #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
-    let mut version_history_lock = opts.version_history.write().expect("lock is poisoned");
+    let mut super_version = opts.super_version.write().expect("lock is poisoned");
 
     // Fail-safe for buggy compaction strategies
     if compaction_state
@@ -631,13 +598,7 @@ fn drop_tables(
 
     let Some(tables) = ids_to_drop
         .iter()
-        .map(|&id| {
-            version_history_lock
-                .latest_version()
-                .version
-                .get_table(id)
-                .cloned()
-        })
+        .map(|&id| super_version.version.get_table(id).cloned())
         .collect::<Option<Vec<_>>>()
     else {
         log::warn!(
@@ -653,27 +614,17 @@ fn drop_tables(
 
     // IMPORTANT: Write the manifest with the removed tables first
     // Otherwise the table files are deleted, but are still referenced!
-    version_history_lock.upgrade_version(
-        &opts.config.path,
-        |current| {
-            let mut copy = current.clone();
+    super_version.upgrade_version(&opts.config.path, |current| {
+        let mut copy = current.clone();
 
-            copy.version = copy
-                .version
-                .with_dropped(ids_to_drop, &mut dropped_blob_files)?;
+        copy.version = copy
+            .version
+            .with_dropped(ids_to_drop, &mut dropped_blob_files)?;
 
-            Ok(copy)
-        },
-        &opts.global_seqno,
-        &opts.visible_seqno,
-    )?;
+        Ok(copy)
+    })?;
 
-    if let Err(e) = version_history_lock.maintenance(&opts.config.path, opts.mvcc_gc_watermark) {
-        log::error!("Manifest maintenance failed: {e:?}");
-        return Err(e);
-    }
-
-    drop(version_history_lock);
+    drop(super_version);
 
     // NOTE: If the application were to crash >here< it's fine
     // The tables are not referenced anymore, and will be
