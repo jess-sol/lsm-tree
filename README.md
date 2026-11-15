@@ -1,3 +1,18 @@
+> **About this fork.** This is [lsm-tree](https://github.com/fjall-rs/lsm-tree) for a caller
+> that keeps its own log, gives every row its sequence number, and runs the tree's work on
+> its own threads. A table install draws no sequence number, so a read at a seqno always
+> begins on the newest tables; in return the tree keeps no older set of tables, and a read
+> at an old seqno does not outlive a `clear`, a `drop_range` or a compaction filter.
+> `Tree::write_sorted` writes a batch of rows that are already in key order as a sealed
+> memtable of its own, read by bisection. `Tree::view` holds the tree for reads that take no
+> lock, and `Config::filter_prefix_len` puts the first bytes of each key into the table
+> filters, so a read under a prefix skips the tables that hold none of it. `Tiered` merges a
+> level whole into the next, and `Tree::compaction` hands such a merge out in parts for the
+> caller's threads to run. It also carries a fix for upstream's issue
+> [#321](https://github.com/fjall-rs/lsm-tree/issues/321): the garbage collection of old
+> versions keeps the one the oldest snapshot reads. The fork sits on upstream's 3.1 line
+> and does not follow it: it serves until upstream's version 4 is released.
+
 <p align="center">
   <img src="/logo.png" height="160">
 </p>
