@@ -48,6 +48,9 @@ pub struct ParsedMeta {
     pub weak_tombstone_count: u64,
     pub weak_tombstone_reclaimable: u64,
 
+    /// The first bytes of each key that the filter holds beside the key; 0 holds none
+    pub filter_prefix_len: u32,
+
     pub data_block_compression: CompressionType,
     pub index_block_compression: CompressionType,
 }
@@ -207,6 +210,12 @@ impl ParsedMeta {
             CompressionType::decode_from(&mut bytes)?
         };
 
+        // A table written before the filter held prefixes has no such property
+        let filter_prefix_len = match block.point_read(b"filter_prefix_len", SeqNo::MAX) {
+            Some(bytes) => (&bytes.value[..]).read_u32::<LittleEndian>()?,
+            None => 0,
+        };
+
         Ok(Self {
             id,
             created_at,
@@ -219,6 +228,7 @@ impl ParsedMeta {
             tombstone_count,
             weak_tombstone_count,
             weak_tombstone_reclaimable,
+            filter_prefix_len,
             data_block_compression,
             index_block_compression,
         })

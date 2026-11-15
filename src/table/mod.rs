@@ -242,40 +242,7 @@ impl Table {
             return Ok(None);
         }
 
-        let filter_block = if let Some(block) = &self.pinned_filter_block {
-            Some(Cow::Borrowed(block))
-        } else if let Some(filter_idx) = &self.pinned_filter_index {
-            let mut iter = filter_idx.iter();
-            iter.seek(key, seqno);
-
-            if let Some(filter_block_handle) = iter.next() {
-                let filter_block_handle = filter_block_handle.materialize(filter_idx.as_slice());
-
-                let block = self.load_block(
-                    &filter_block_handle.into_inner(),
-                    BlockType::Filter,
-                    CompressionType::None, // NOTE: We never write a filter block with compression
-                )?;
-                let block = FilterBlock::new(block);
-
-                Some(Cow::Owned(block))
-            } else {
-                None
-            }
-        } else if let Some(_filter_tli_handle) = &self.regions.filter_tli {
-            unimplemented!("unpinned filter TLI not supported");
-        } else if let Some(filter_block_handle) = &self.regions.filter {
-            let block = self.load_block(
-                filter_block_handle,
-                BlockType::Filter,
-                CompressionType::None, // NOTE: We never write a filter block with compression
-            )?;
-            let block = FilterBlock::new(block);
-
-            Some(Cow::Owned(block))
-        } else {
-            None
-        };
+        let filter_block = self.filter_block_for(key, seqno)?;
 
         if let Some(filter_block) = &filter_block {
             if !filter_block.maybe_contains_hash(key_hash)? {
@@ -308,6 +275,75 @@ impl Table {
                 }
             })
         }
+    }
+
+    /// Whether the table holds no key in `bounds`, as far as its key range and its
+    /// filter tell.
+    ///
+    /// The filter tells where it holds each key's first bytes (see
+    /// [`crate::Config::filter_prefix_len`]) and every key in `bounds` begins with
+    /// the same such bytes.
+    pub(crate) fn rules_out_range(
+        &self,
+        bounds: &(Bound<&[u8]>, Bound<&[u8]>),
+    ) -> crate::Result<bool> {
+        if !self.check_key_range_overlap(bounds) {
+            return Ok(true);
+        }
+
+        let Some(prefix) = prefix_of_range(bounds, self.metadata.filter_prefix_len as usize) else {
+            return Ok(false);
+        };
+
+        let Some(filter_block) = self.filter_block_for(prefix, SeqNo::MAX)? else {
+            return Ok(false);
+        };
+
+        let hash = filter::standard_bloom::Builder::get_hash(prefix);
+        Ok(!filter_block.maybe_contains_hash(hash)?)
+    }
+
+    /// The filter block that answers for `key`: the whole filter, or the partition a
+    /// seek of `key` finds.
+    fn filter_block_for(
+        &self,
+        key: &[u8],
+        seqno: SeqNo,
+    ) -> crate::Result<Option<Cow<'_, FilterBlock>>> {
+        Ok(if let Some(block) = &self.pinned_filter_block {
+            Some(Cow::Borrowed(block))
+        } else if let Some(filter_idx) = &self.pinned_filter_index {
+            let mut iter = filter_idx.iter();
+            iter.seek(key, seqno);
+
+            if let Some(filter_block_handle) = iter.next() {
+                let filter_block_handle = filter_block_handle.materialize(filter_idx.as_slice());
+
+                let block = self.load_block(
+                    &filter_block_handle.into_inner(),
+                    BlockType::Filter,
+                    CompressionType::None, // NOTE: We never write a filter block with compression
+                )?;
+                let block = FilterBlock::new(block);
+
+                Some(Cow::Owned(block))
+            } else {
+                None
+            }
+        } else if let Some(_filter_tli_handle) = &self.regions.filter_tli {
+            unimplemented!("unpinned filter TLI not supported");
+        } else if let Some(filter_block_handle) = &self.regions.filter {
+            let block = self.load_block(
+                filter_block_handle,
+                BlockType::Filter,
+                CompressionType::None, // NOTE: We never write a filter block with compression
+            )?;
+            let block = FilterBlock::new(block);
+
+            Some(Cow::Owned(block))
+        } else {
+            None
+        })
     }
 
     // TODO: maybe we can skip Fuse costs of the user key
@@ -650,5 +686,50 @@ impl Table {
         todo!()
 
         //  self.metadata.tombstone_count as f32 / self.metadata.key_count as f32
+    }
+}
+
+/// The first `len` bytes of every key in `bounds`, where `len` is not 0 and they
+/// are the same bytes for all of them.
+fn prefix_of_range<'a>(
+    bounds: &(Bound<&'a [u8]>, Bound<&'a [u8]>),
+    len: usize,
+) -> Option<&'a [u8]> {
+    if len == 0 {
+        return None;
+    }
+
+    let (Bound::Included(start) | Bound::Excluded(start)) = bounds.0 else {
+        return None;
+    };
+    let prefix = start.get(..len)?;
+
+    // The keys from `start` on begin with `prefix` up to the first byte string past all that do
+    let within = match bounds.1 {
+        Bound::Included(end) => end.starts_with(prefix),
+        Bound::Excluded(end) => end.starts_with(prefix) || is_first_past(end, prefix),
+        Bound::Unbounded => false,
+    };
+
+    within.then_some(prefix)
+}
+
+/// Whether `end` is the first byte string past every one that begins with `prefix`:
+/// `prefix` less its trailing `0xFF` bytes, its last byte one higher.
+fn is_first_past(end: &[u8], prefix: &[u8]) -> bool {
+    let trailing = prefix
+        .iter()
+        .rev()
+        .take_while(|&&byte| byte == u8::MAX)
+        .count();
+    let counted = prefix
+        .get(..prefix.len() - trailing)
+        .and_then(<[u8]>::split_last);
+
+    match (end.split_last(), counted) {
+        (Some((end_last, end_head)), Some((last, head))) => {
+            end_head == head && last.checked_add(1) == Some(*end_last)
+        }
+        _ => false,
     }
 }

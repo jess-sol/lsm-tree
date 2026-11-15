@@ -185,7 +185,7 @@ pub use {
     memtable::{Memtable, MemtableId},
     seqno::SequenceNumberCounter,
     slice::Slice,
-    tree::Tree,
+    tree::{Tree, View},
     value::SeqNo,
     value_type::ValueType,
     vlog::BlobFile,

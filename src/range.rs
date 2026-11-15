@@ -9,8 +9,8 @@ use crate::{
     mvcc_stream::MvccStream,
     run_reader::RunReader,
     value::{SeqNo, UserKey},
-    version::SuperVersion,
-    BoxedIterator, InternalValue,
+    version::{Run, SuperVersion},
+    BoxedIterator, InternalValue, Table,
 };
 use self_cell::self_cell;
 use std::{
@@ -147,6 +147,15 @@ impl TreeIter {
 
             let mut iters: Vec<BoxedIterator<'_>> = Vec::with_capacity(5);
 
+            let user_range = (
+                range.start_bound().map(|x| &x.user_key).cloned(),
+                range.end_bound().map(|x| &x.user_key).cloned(),
+            );
+            let bounds = (
+                range.start_bound().map(|x| &*x.user_key),
+                range.end_bound().map(|x| &*x.user_key),
+            );
+
             for run in lock
                 .version
                 .version
@@ -161,31 +170,24 @@ impl TreeIter {
                         #[expect(clippy::expect_used, reason = "we checked for length")]
                         let table = run.first().expect("should exist");
 
-                        if table.check_key_range_overlap(&(
-                            range.start_bound().map(|x| &*x.user_key),
-                            range.end_bound().map(|x| &*x.user_key),
-                        )) {
-                            let reader = table
-                                .range((
-                                    range.start_bound().map(|x| &x.user_key).cloned(),
-                                    range.end_bound().map(|x| &x.user_key).cloned(),
-                                ))
-                                .filter(move |item| match item {
-                                    Ok(item) => seqno_filter(item.key.seqno, seqno),
-                                    Err(_) => true,
-                                });
+                        if !rules_out(table, &bounds) {
+                            let reader =
+                                table
+                                    .range(user_range.clone())
+                                    .filter(move |item| match item {
+                                        Ok(item) => seqno_filter(item.key.seqno, seqno),
+                                        Err(_) => true,
+                                    });
 
                             iters.push(Box::new(reader));
                         }
                     }
                     _ => {
-                        if let Some(reader) = RunReader::new(
-                            run.clone(),
-                            (
-                                range.start_bound().map(|x| &x.user_key).cloned(),
-                                range.end_bound().map(|x| &x.user_key).cloned(),
-                            ),
-                        ) {
+                        if rules_out_run(run, &user_range, &bounds) {
+                            continue;
+                        }
+
+                        if let Some(reader) = RunReader::new(run.clone(), user_range.clone()) {
                             iters.push(Box::new(reader.filter(move |item| match item {
                                 Ok(item) => seqno_filter(item.key.seqno, seqno),
                                 Err(_) => true,
@@ -233,6 +235,24 @@ impl TreeIter {
             }))
         })
     }
+}
+
+/// Whether every table of `run` that the range reaches rules the range out. The
+/// first that does not ends the asking.
+fn rules_out_run(
+    run: &Run<Table>,
+    user_range: &(Bound<UserKey>, Bound<UserKey>),
+    bounds: &(Bound<&[u8]>, Bound<&[u8]>),
+) -> bool {
+    run.range_overlap_indexes(user_range)
+        .and_then(|(lo, hi)| run.get(lo..=hi))
+        .is_some_and(|tables| tables.iter().all(|table| rules_out(table, bounds)))
+}
+
+/// A filter block that is not read rules nothing out: the read of the table itself
+/// reports the fault.
+fn rules_out(table: &Table, bounds: &(Bound<&[u8]>, Bound<&[u8]>)) -> bool {
+    table.rules_out_range(bounds).unwrap_or(false)
 }
 
 #[cfg(test)]

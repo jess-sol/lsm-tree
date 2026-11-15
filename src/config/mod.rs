@@ -226,6 +226,9 @@ pub struct Config {
     /// Filter construction policy
     pub filter_policy: FilterPolicy,
 
+    /// The first bytes of each key that a table's filter holds beside the key; 0 holds none
+    pub(crate) filter_prefix_len: u32,
+
     /// Compaction filter factory
     pub compaction_filter_factory: Option<Arc<dyn Factory>>,
 
@@ -290,6 +293,8 @@ impl Default for Config {
             filter_policy: FilterPolicy::all(FilterPolicyEntry::Bloom(
                 BloomConstructionPolicy::BitsPerKey(10.0),
             )),
+
+            filter_prefix_len: 0,
 
             compaction_filter_factory: None,
 
@@ -403,6 +408,20 @@ impl Config {
     #[must_use]
     pub fn filter_policy(mut self, policy: FilterPolicy) -> Self {
         self.filter_policy = policy;
+        self
+    }
+
+    /// Makes a table's filter hold each key's first `len` bytes beside the key.
+    ///
+    /// A read of the keys under a prefix of at least `len` bytes then skips a
+    /// table whose filter holds none of it. A key shorter than `len` adds no
+    /// prefix. 0, the default, holds no prefix.
+    ///
+    /// The length is kept in each table's metadata, so a table written under
+    /// another length answers by its own.
+    #[must_use]
+    pub fn filter_prefix_len(mut self, len: u32) -> Self {
+        self.filter_prefix_len = len;
         self
     }
 

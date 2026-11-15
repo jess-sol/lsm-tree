@@ -42,6 +42,8 @@ pub struct MultiWriter {
 
     bloom_policy: BloomConstructionPolicy,
 
+    filter_prefix_len: u32,
+
     current_key: Option<UserKey>,
 
     linked_blobs: HashMap<BlobFileId, LinkedFile>,
@@ -87,6 +89,8 @@ impl MultiWriter {
             use_partitioned_filter: false,
 
             bloom_policy: BloomConstructionPolicy::default(),
+
+            filter_prefix_len: 0,
 
             current_key: None,
 
@@ -177,6 +181,13 @@ impl MultiWriter {
         self
     }
 
+    #[must_use]
+    pub fn use_filter_prefix_len(mut self, len: u32) -> Self {
+        self.filter_prefix_len = len;
+        self.writer = self.writer.use_filter_prefix_len(len);
+        self
+    }
+
     /// Flushes the current writer, stores its metadata, and sets up a new writer for the next table
     fn rotate(&mut self) -> crate::Result<()> {
         log::debug!("Rotating table writer");
@@ -191,6 +202,7 @@ impl MultiWriter {
             .use_data_block_restart_interval(self.data_block_restart_interval)
             .use_index_block_restart_interval(self.index_block_restart_interval)
             .use_bloom_policy(self.bloom_policy)
+            .use_filter_prefix_len(self.filter_prefix_len)
             .use_data_block_hash_ratio(self.data_block_hash_ratio);
 
         if self.use_partitioned_index {

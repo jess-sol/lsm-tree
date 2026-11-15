@@ -1470,3 +1470,43 @@ fn table_return_global_seqno() -> crate::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn a_range_has_a_prefix_only_where_every_key_in_it_does() {
+    use std::ops::Bound::{Excluded, Included, Unbounded};
+
+    let cases: [(Bound<&[u8]>, Bound<&[u8]>, Option<&[u8]>); 12] = [
+        (Included(b"abcd1"), Included(b"abcd9"), Some(b"abcd")),
+        (Excluded(b"abcd1"), Excluded(b"abcd9"), Some(b"abcd")),
+        (Included(b"abcd"), Included(b"abcd"), Some(b"abcd")),
+        // A scan of a prefix ends at the first byte string past it
+        (Included(b"abcd"), Excluded(b"abce"), Some(b"abcd")),
+        (Included(b"abcd7"), Excluded(b"abce"), Some(b"abcd")),
+        (
+            Included(b"ab\xFF\xFF"),
+            Excluded(b"ac"),
+            Some(b"ab\xFF\xFF"),
+        ),
+        (Included(b"abcd"), Included(b"abce"), None),
+        (Included(b"abcd"), Excluded(b"abce0"), None),
+        (Included(b"abcd"), Excluded(b"abd"), None),
+        (Included(b"abcd"), Unbounded, None),
+        (Unbounded, Included(b"abcd"), None),
+        // A key shorter than the length has no prefix
+        (Included(b"abc"), Included(b"abcd"), None),
+    ];
+
+    for (start, end, prefix) in cases {
+        assert_eq!(
+            prefix,
+            prefix_of_range(&(start, end), 4),
+            "{start:?}..{end:?}"
+        );
+    }
+
+    assert_eq!(
+        None,
+        prefix_of_range(&(Included(b"abcd"), Included(b"abcd")), 0),
+        "no length, no prefix",
+    );
+}

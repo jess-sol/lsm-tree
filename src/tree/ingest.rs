@@ -52,6 +52,7 @@ impl<'a> Ingestion<'a> {
             64 * 1_024 * 1_024,
             6,
         )?
+        .use_filter_prefix_len(tree.config.filter_prefix_len)
         .use_bloom_policy({
             if tree.config.expect_point_read_hits {
                 crate::config::BloomConstructionPolicy::BitsPerKey(0.0)

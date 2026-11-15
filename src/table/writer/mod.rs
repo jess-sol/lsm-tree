@@ -86,6 +86,9 @@ pub struct Writer {
 
     bloom_policy: BloomConstructionPolicy,
 
+    /// The first bytes of each key that the filter holds beside the key; 0 holds none
+    filter_prefix_len: u32,
+
     /// Tracks the previously written item to detect weak tombstone/value pairs
     previous_item: Option<(UserKey, ValueType)>,
 
@@ -136,6 +139,8 @@ impl Writer {
             current_key: None,
 
             bloom_policy: BloomConstructionPolicy::default(),
+
+            filter_prefix_len: 0,
 
             previous_item: None,
 
@@ -233,6 +238,12 @@ impl Writer {
         self
     }
 
+    #[must_use]
+    pub fn use_filter_prefix_len(mut self, len: u32) -> Self {
+        self.filter_prefix_len = len;
+        self
+    }
+
     /// Writes an item.
     ///
     /// # Note
@@ -266,13 +277,28 @@ impl Writer {
         // NOTE: Check if we visit a new key
         if Some(&user_key) != self.current_key.as_ref() {
             self.meta.key_count += 1;
-            self.current_key = Some(user_key.clone());
+            let previous_key = self.current_key.replace(user_key.clone());
 
             // IMPORTANT: Do not buffer *every* item's key
             // because there may be multiple versions
             // of the same key
 
             if self.bloom_policy.is_active() {
+                // A prefix goes in before its first key, so a partitioned filter
+                // that ends a partition here still finds both by a seek
+                let len = self.filter_prefix_len as usize;
+
+                if let Some(prefix) = user_key.get(..len).filter(|_| len > 0) {
+                    let begins_here = previous_key
+                        .as_ref()
+                        .is_none_or(|previous| previous.get(..len) != Some(prefix));
+
+                    // A key of exactly the length is its own prefix
+                    if begins_here && user_key.len() > len {
+                        self.filter_writer.register_key(&prefix.into())?;
+                    }
+                }
+
                 self.filter_writer.register_key(&user_key)?;
             }
         }
@@ -448,6 +474,7 @@ impl Writer {
                 ),
                 meta("file_size", &self.meta.file_pos.to_le_bytes()),
                 meta("filter_hash_type", &[u8::from(ChecksumType::Xxh3)]),
+                meta("filter_prefix_len", &self.filter_prefix_len.to_le_bytes()),
                 meta("index_keys_have_seqno", &[0x1]),
                 meta("initial_level", &self.initial_level.to_le_bytes()),
                 meta("item_count", &(self.meta.item_count as u64).to_le_bytes()),
