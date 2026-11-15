@@ -407,8 +407,12 @@ fn merge_tables(
         &filter_ctx,
     ));
 
-    let table_writer =
-        super::flavour::prepare_table_writer(&current_super_version.version, opts, payload)?;
+    let table_writer = super::flavour::prepare_table_writer(
+        current_super_version.version.level_count(),
+        &opts.config,
+        &opts.table_id_generator,
+        payload,
+    )?;
 
     let start = Instant::now();
 

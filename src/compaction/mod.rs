@@ -12,16 +12,18 @@ pub mod filter;
 mod flavour;
 pub(crate) mod major;
 pub(crate) mod movedown;
+mod parts;
 pub(crate) mod pulldown;
 pub(crate) mod state;
 pub(crate) mod stream;
-// pub(crate) mod tiered;
+mod tiered;
 pub(crate) mod worker;
 
 pub use fifo::Strategy as Fifo;
 pub use filter::{CompactionFilter, Factory, ItemAccessor, Verdict};
 pub use leveled::Strategy as Leveled;
-// pub use tiered::Strategy as SizeTiered;
+pub use parts::{Compaction, Merged, Part};
+pub use tiered::Tiered;
 
 pub use {fifo::NAME as FIFO_COMPACTION_NAME, leveled::NAME as LEVELED_COMPACTION_NAME};
 

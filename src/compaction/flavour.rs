@@ -9,10 +9,10 @@ use crate::compaction::worker::Options;
 use crate::compaction::Input as CompactionPayload;
 use crate::file::TABLES_FOLDER;
 use crate::table::multi_writer::MultiWriter;
-use crate::version::{SuperVersion, Version};
+use crate::version::SuperVersion;
 use crate::vlog::blob_file::scanner::ScanEntry;
 use crate::vlog::{BlobFileId, BlobFileMergeScanner, BlobFileWriter};
-use crate::{BlobFile, HashSet, InternalValue, Table};
+use crate::{BlobFile, Config, HashSet, InternalValue, SequenceNumberCounter, Table};
 use std::iter::Peekable;
 use std::time::Instant;
 
@@ -41,40 +41,41 @@ fn drain_blobs<I: Iterator<Item = crate::Result<(ScanEntry, BlobFileId)>>>(
     Ok(())
 }
 
+/// The writer of a merge's output tables, set up for the level the merge writes to.
 pub(super) fn prepare_table_writer(
-    version: &Version,
-    opts: &Options,
+    level_count: usize,
+    config: &Config,
+    table_id_generator: &SequenceNumberCounter,
     payload: &CompactionPayload,
 ) -> crate::Result<MultiWriter> {
-    let table_base_folder = opts.config.path.join(TABLES_FOLDER);
+    let table_base_folder = config.path.join(TABLES_FOLDER);
 
     let dst_lvl = payload.canonical_level.into();
 
-    let data_block_size = opts.config.data_block_size_policy.get(dst_lvl);
+    let data_block_size = config.data_block_size_policy.get(dst_lvl);
 
-    let data_block_restart_interval = opts.config.data_block_restart_interval_policy.get(dst_lvl);
-    let index_block_restart_interval = opts.config.index_block_restart_interval_policy.get(dst_lvl);
+    let data_block_restart_interval = config.data_block_restart_interval_policy.get(dst_lvl);
+    let index_block_restart_interval = config.index_block_restart_interval_policy.get(dst_lvl);
 
-    let data_block_compression = opts.config.data_block_compression_policy.get(dst_lvl);
-    let index_block_compression = opts.config.index_block_compression_policy.get(dst_lvl);
+    let data_block_compression = config.data_block_compression_policy.get(dst_lvl);
+    let index_block_compression = config.index_block_compression_policy.get(dst_lvl);
 
-    let data_block_hash_ratio = opts.config.data_block_hash_ratio_policy.get(dst_lvl);
+    let data_block_hash_ratio = config.data_block_hash_ratio_policy.get(dst_lvl);
 
-    let index_partitioning = opts.config.index_block_partitioning_policy.get(dst_lvl);
-    let filter_partitioning = opts.config.filter_block_partitioning_policy.get(dst_lvl);
+    let index_partitioning = config.index_block_partitioning_policy.get(dst_lvl);
+    let filter_partitioning = config.filter_block_partitioning_policy.get(dst_lvl);
 
     log::debug!(
-        "Compacting tables {:?} into L{} (canonical L{}), target_size={}, data_block_restart_interval={data_block_restart_interval}, index_block_restart_interval={index_block_restart_interval}, data_block_size={data_block_size}, data_block_compression={data_block_compression:?}, index_block_compression={index_block_compression:?}, mvcc_gc_watermark={}",
+        "Compacting tables {:?} into L{} (canonical L{}), target_size={}, data_block_restart_interval={data_block_restart_interval}, index_block_restart_interval={index_block_restart_interval}, data_block_size={data_block_size}, data_block_compression={data_block_compression:?}, index_block_compression={index_block_compression:?}",
         payload.table_ids,
         payload.dest_level,
         payload.canonical_level,
         payload.target_size,
-        opts.mvcc_gc_watermark,
     );
 
     let mut table_writer = MultiWriter::new(
         table_base_folder,
-        opts.table_id_generator.clone(),
+        table_id_generator.clone(),
         payload.target_size,
         payload.dest_level,
     )?;
@@ -87,7 +88,7 @@ pub(super) fn prepare_table_writer(
     }
 
     #[expect(clippy::cast_possible_truncation, reason = "max key size = u16")]
-    let last_level = (version.level_count() - 1) as u8;
+    let last_level = (level_count - 1) as u8;
     let is_last_level = payload.dest_level == last_level;
 
     Ok(table_writer
@@ -97,19 +98,15 @@ pub(super) fn prepare_table_writer(
         .use_data_block_size(data_block_size)
         .use_data_block_hash_ratio(data_block_hash_ratio)
         .use_index_block_compression(index_block_compression)
-        .use_filter_prefix_len(opts.config.filter_prefix_len)
+        .use_filter_prefix_len(config.filter_prefix_len)
         .use_bloom_policy({
             use crate::config::FilterPolicyEntry::{Bloom, None};
             use crate::table::filter::BloomConstructionPolicy;
 
-            if is_last_level && opts.config.expect_point_read_hits {
+            if is_last_level && config.expect_point_read_hits {
                 BloomConstructionPolicy::BitsPerKey(0.0)
             } else {
-                match opts
-                    .config
-                    .filter_policy
-                    .get(usize::from(payload.dest_level))
-                {
+                match config.filter_policy.get(usize::from(payload.dest_level)) {
                     Bloom(policy) => policy,
                     None => BloomConstructionPolicy::BitsPerKey(0.0),
                 }
